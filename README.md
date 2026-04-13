@@ -1,7 +1,19 @@
 # Codex Remote Login Script
 
-`remote-codex-login.sh` wraps `codex login --device-auth` so you can complete
-ChatGPT authentication from a remote or headless console.
+`remote-codex-login.sh` wraps regular `codex login` for remote console use.
+
+The normal browser login flow starts a callback server on the remote host such
+as `http://localhost:1455/auth/callback`. If you open the login URL on your
+local machine, the browser tries to redirect to your own localhost and the
+final step does not reach the remote host automatically.
+
+This script solves that by:
+
+1. starting `codex login`
+2. extracting and printing the ChatGPT login URL
+3. asking you to finish login in your local browser
+4. asking you to paste the final `http://localhost:PORT/auth/callback?...` URL
+5. replaying that callback against the remote host's localhost port
 
 ## Usage
 
@@ -9,15 +21,14 @@ ChatGPT authentication from a remote or headless console.
 ./remote-codex-login.sh
 ```
 
-The script will:
+After the script prints the login URL:
 
-1. show the current `codex login` status
-2. ask whether to start device login
-3. run `codex login --device-auth`
-4. show login status again after authentication finishes
-
-During login, open the displayed URL in a browser on your local machine,
-sign in, and choose a workspace if ChatGPT asks for one.
+1. open it in a browser on your local machine
+2. sign in with your account
+3. complete password or passkey flow
+4. choose a workspace if ChatGPT asks
+5. copy the final failed `localhost` URL from the browser address bar
+6. paste that URL back into the script
 
 ## Options
 

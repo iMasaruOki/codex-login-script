@@ -138,6 +138,26 @@ async function httpPut(url) {
   });
 }
 
+function targetScore(target) {
+  const url = target.url || "";
+  if (url.includes("accounts.google.com")) {
+    return 100;
+  }
+  if (url.includes("appleid.apple.com")) {
+    return 90;
+  }
+  if (url.includes("login.live.com") || url.includes("microsoft")) {
+    return 80;
+  }
+  if (url.includes("auth.openai.com")) {
+    return 70;
+  }
+  if (url !== "about:blank") {
+    return 10;
+  }
+  return 0;
+}
+
 class CdpClient {
   constructor(webSocketUrl) {
     this.webSocketUrl = webSocketUrl;
@@ -244,6 +264,27 @@ async function terminateProcess(child) {
     child.kill("SIGKILL");
     await closed;
   }
+}
+
+async function closeClient(client) {
+  if (!client) {
+    return;
+  }
+  if (client.ws && client.ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  try {
+    client.ws.terminate();
+  } catch {}
+}
+
+function killProcessNow(child) {
+  if (!child || child.exitCode !== null) {
+    return;
+  }
+  try {
+    child.kill("SIGKILL");
+  } catch {}
 }
 
 function visibleTextSnippet(text) {
@@ -446,6 +487,43 @@ async function submitActiveElement(client) {
   return result.result.value;
 }
 
+async function listPageTargets(debugPort) {
+  const targets = await httpGetJson(`http://127.0.0.1:${debugPort}/json/list`);
+  return targets.filter((target) => target.type === "page");
+}
+
+async function maybeSwitchTarget(state, previousUrl = "") {
+  const targets = await listPageTargets(state.debugPort);
+  const current = targets.find((target) => target.id === state.targetId);
+
+  const candidates = targets
+    .filter((target) => target.id !== state.targetId)
+    .map((target) => ({ target, score: targetScore(target) }))
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  if (candidates.length === 0) {
+    return false;
+  }
+
+  const best = candidates[0].target;
+  const currentUrl = current?.url || previousUrl || "";
+  if (best.url === currentUrl && candidates[0].score < 100) {
+    return false;
+  }
+
+  await closeClient(state.client);
+  state.client = new CdpClient(best.webSocketDebuggerUrl);
+  await state.client.connect();
+  await state.client.call("Page.enable");
+  await state.client.call("Runtime.enable");
+  await state.client.call("Network.enable");
+  state.targetId = best.id;
+  state.webSocketDebuggerUrl = best.webSocketDebuggerUrl;
+  process.stdout.write(`Switched to browser target: ${best.url || "(untitled)"}\n`);
+  return true;
+}
+
 function findElement(snapshot, index) {
   const numericIndex = Number(index);
   if (!Number.isInteger(numericIndex) || numericIndex < 0 || numericIndex >= snapshot.elements.length) {
@@ -493,9 +571,9 @@ function renderSnapshot(snapshot) {
   process.stdout.write("\n");
 }
 
-async function interactiveLoop(client, codexChild) {
+async function interactiveLoop(state, codexChild) {
   while (true) {
-    const snapshot = await snapshotPage(client);
+    const snapshot = await snapshotPage(state.client);
     renderSnapshot(snapshot);
 
     if (codexChild.exitCode !== null) {
@@ -510,7 +588,7 @@ async function interactiveLoop(client, codexChild) {
     const [command, ...rest] = commandLine.split(" ");
 
     if (command === "quit" || command === "exit") {
-      throw new Error("Cancelled by user");
+      return "quit";
     }
 
     if (command === "show") {
@@ -523,7 +601,7 @@ async function interactiveLoop(client, codexChild) {
     }
 
     if (command === "back") {
-      await client.call("Page.goBack");
+      await state.client.call("Page.goBack");
       await sleep(1200);
       continue;
     }
@@ -534,13 +612,14 @@ async function interactiveLoop(client, codexChild) {
         process.stdout.write("Usage: open URL\n");
         continue;
       }
-      await navigate(client, url);
+      await navigate(state.client, url);
       continue;
     }
 
     if (command === "enter") {
-      await submitActiveElement(client);
+      await submitActiveElement(state.client);
       await sleep(1200);
+      await maybeSwitchTarget(state, snapshot.url);
       continue;
     }
 
@@ -551,11 +630,12 @@ async function interactiveLoop(client, codexChild) {
         continue;
       }
       if (Number.isFinite(element.x) && Number.isFinite(element.y)) {
-        await clickElementAt(client, element.x, element.y);
+        await clickElementAt(state.client, element.x, element.y);
       } else {
-        await clickElement(client, element.id);
+        await clickElement(state.client, element.id);
       }
       await sleep(1200);
+      await maybeSwitchTarget(state, snapshot.url);
       continue;
     }
 
@@ -576,7 +656,7 @@ async function interactiveLoop(client, codexChild) {
         value = await promptLine(`Value for control ${rest[0]}: `);
       }
 
-      const outcome = await setElementValue(client, element.id, value);
+      const outcome = await setElementValue(state.client, element.id, value);
       if (outcome === "no-option") {
         process.stdout.write("No matching option.\n");
       }
@@ -612,6 +692,8 @@ function commandExists(command) {
 async function main() {
   let assumeYes = false;
   let forceLogin = false;
+  let exitCode = null;
+  let quitRequested = false;
 
   for (const arg of process.argv.slice(2)) {
     if (arg === "-y" || arg === "--yes") {
@@ -654,9 +736,11 @@ async function main() {
   }
 
   const codexLog = { stdout: "", stderr: "" };
-  const codexChild = spawn("bash", ["-lc", "printf '\\n' | codex login"], {
-    stdio: ["ignore", "pipe", "pipe"],
+  const codexChild = spawn("codex", ["login"], {
+    stdio: ["pipe", "pipe", "pipe"],
   });
+  codexChild.stdin.write("\n");
+  codexChild.stdin.end();
   codexChild.stdout.on("data", (chunk) => {
     codexLog.stdout += chunk.toString();
   });
@@ -665,7 +749,7 @@ async function main() {
   });
 
   const { authUrl, loginPort } = await waitForCodexBootstrap(codexChild, codexLog);
-  process.stdout.write("Starting headless browser on the remote host.\n");
+  process.stdout.write("Starting browser on the remote host.\n");
   process.stdout.write(`Codex callback port: ${loginPort}\n\n`);
 
   const browserUserDataDir = createTempDir("codex-login-browser-");
@@ -700,20 +784,20 @@ async function main() {
     browserBuffer.stderr += chunk.toString();
   });
 
-  let client;
+  let state = null;
 
   const cleanup = async () => {
     if (activePrompt) {
       activePrompt.close();
       activePrompt = null;
     }
-    if (client) {
-      try {
-        await client.close();
-      } catch {}
+    if (state?.client) {
+      await closeClient(state.client);
     }
-    await terminateProcess(browserChild);
-    await terminateProcess(codexChild);
+    await Promise.allSettled([
+      terminateProcess(browserChild),
+      terminateProcess(codexChild),
+    ]);
     try {
       fs.rmSync(browserUserDataDir, { recursive: true, force: true });
     } catch {}
@@ -730,28 +814,54 @@ async function main() {
     const pageInfo = await httpPut(`http://127.0.0.1:${browserDebugPort}/json/new?about:blank`);
     const page = JSON.parse(pageInfo);
 
-    client = new CdpClient(page.webSocketDebuggerUrl);
+    const client = new CdpClient(page.webSocketDebuggerUrl);
     await client.connect();
     await client.call("Page.enable");
     await client.call("Runtime.enable");
     await client.call("Network.enable");
     await hardenBrowserSession(client);
     await navigate(client, authUrl);
+    state = {
+      client,
+      debugPort: browserDebugPort,
+      targetId: page.id,
+      webSocketDebuggerUrl: page.webSocketDebuggerUrl,
+    };
 
     process.stdout.write(`The browser page is open on the remote host (${browserMode} mode).\n`);
     process.stdout.write("Use the terminal commands below to fill fields and click buttons.\n");
     process.stdout.write("Passkeys and CAPTCHA may still require a different auth path.\n");
 
-    await interactiveLoop(client, codexChild);
-
-    await new Promise((resolve) => codexChild.once("close", resolve));
-    process.stdout.write("\nAuthentication completed.\n\n");
-    const postStatus = await execCapture("codex", ["login", "status"]);
-    const postOutput = `${postStatus.stdout}${postStatus.stderr}`.trim() || "Unknown";
-    process.stdout.write("Login status after authentication:\n");
-    process.stdout.write(`${postOutput}\n`);
+    const loopResult = await interactiveLoop(state, codexChild);
+    if (loopResult === "quit") {
+      process.stdout.write("Cancelled.\n");
+      exitCode = 0;
+      quitRequested = true;
+    } else {
+      await new Promise((resolve) => codexChild.once("close", resolve));
+      process.stdout.write("\nAuthentication completed.\n\n");
+      const postStatus = await execCapture("codex", ["login", "status"]);
+      const postOutput = `${postStatus.stdout}${postStatus.stderr}`.trim() || "Unknown";
+      process.stdout.write("Login status after authentication:\n");
+      process.stdout.write(`${postOutput}\n`);
+    }
   } finally {
+    if (quitRequested) {
+      if (state?.client) {
+        await closeClient(state.client);
+      }
+      killProcessNow(browserChild);
+      killProcessNow(codexChild);
+      try {
+        fs.rmSync(browserUserDataDir, { recursive: true, force: true });
+      } catch {}
+      process.exit(0);
+    }
     await cleanup();
+  }
+
+  if (exitCode !== null) {
+    process.exit(exitCode);
   }
 }
 

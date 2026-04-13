@@ -807,20 +807,39 @@ function isChromeInterruptionSnapshot(snapshot) {
   return /can't update chrome|finish update|chrome couldn't update|restore pages|restore/i.test(text);
 }
 
+function isUsefulAuthSnapshot(snapshot) {
+  const text = `${snapshot.title || ""}\n${snapshot.text || ""}`;
+  return /welcome back|enter your password|continue with google|email address|forgot password|log in with a one-time code/i.test(text);
+}
+
+function isLoadingOnlySnapshot(snapshot) {
+  const labels = (snapshot.elements || []).map((element) => element.label).filter(Boolean);
+  if (labels.length === 0) {
+    return true;
+  }
+  const text = labels.join("\n");
+  return /^([v+x:.®@iba\s]+|loading\.?|auth\.openai\.com\/oauth\/authorize[\s\S]*)$/i.test(text)
+    || (/loading/i.test(text) && !isUsefulAuthSnapshot(snapshot));
+}
+
 async function stabilizeOcrBrowser(state, authUrl) {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     await openUrlInBrowserChrome(state, authUrl);
-    await sleep(1800);
-    const snapshot = await captureOcrSnapshot(state);
-    state.lastSnapshot = snapshot;
-    const text = `${snapshot.title || ""}\n${snapshot.text || ""}`;
-    if (/welcome back|enter your password|continue with google|email address/i.test(text)) {
-      state.lastSeenUrl = authUrl;
-      return;
-    }
-    if (!isChromeInterruptionSnapshot(snapshot) && snapshot.elements.length > 0) {
-      state.lastSeenUrl = authUrl;
-      return;
+    for (let settleAttempt = 0; settleAttempt < 8; settleAttempt += 1) {
+      await sleep(1200);
+      const snapshot = await captureOcrSnapshot(state);
+      state.lastSnapshot = snapshot;
+      if (isUsefulAuthSnapshot(snapshot)) {
+        state.lastSeenUrl = authUrl;
+        return;
+      }
+      if (isChromeInterruptionSnapshot(snapshot)) {
+        break;
+      }
+      if (!isLoadingOnlySnapshot(snapshot) && snapshot.elements.length > 0) {
+        state.lastSeenUrl = authUrl;
+        return;
+      }
     }
   }
 }

@@ -303,11 +303,23 @@ async function snapshotPage(client) {
       const name = el.getAttribute('name') || '';
       const htmlId = el.getAttribute('id') || '';
       const value = tag === 'select' ? el.value : (el.value || '');
+      const rect = el.getBoundingClientRect();
       const label = aria || labelFor.get(htmlId) || text || placeholder || name || htmlId || '';
       const options = tag === 'select'
         ? Array.from(el.options).map((option) => option.textContent.replace(/\\s+/g, ' ').trim()).filter(Boolean)
         : [];
-      elements.push({ id, tag, type, label, placeholder, name, value, options });
+      elements.push({
+        id,
+        tag,
+        type,
+        label,
+        placeholder,
+        name,
+        value,
+        options,
+        x: rect.left + (rect.width / 2),
+        y: rect.top + (rect.height / 2)
+      });
     }
 
     return {
@@ -361,6 +373,29 @@ async function clickElement(client, elementId) {
     awaitPromise: true,
   });
   return result.result.value;
+}
+
+async function clickElementAt(client, x, y) {
+  await client.call("Input.dispatchMouseEvent", {
+    type: "mouseMoved",
+    x,
+    y,
+    button: "none",
+  });
+  await client.call("Input.dispatchMouseEvent", {
+    type: "mousePressed",
+    x,
+    y,
+    button: "left",
+    clickCount: 1,
+  });
+  await client.call("Input.dispatchMouseEvent", {
+    type: "mouseReleased",
+    x,
+    y,
+    button: "left",
+    clickCount: 1,
+  });
 }
 
 async function setElementValue(client, elementId, value) {
@@ -515,7 +550,11 @@ async function interactiveLoop(client, codexChild) {
         process.stdout.write("Unknown control index.\n");
         continue;
       }
-      await clickElement(client, element.id);
+      if (Number.isFinite(element.x) && Number.isFinite(element.y)) {
+        await clickElementAt(client, element.x, element.y);
+      } else {
+        await clickElement(client, element.id);
+      }
       await sleep(1200);
       continue;
     }

@@ -9,6 +9,24 @@ The browser backend stays on the remote machine, so the OAuth callback to
 If `xvfb-run` is available, the script prefers a normal Chromium session inside
 Xvfb. Otherwise it falls back to headless Chromium.
 
+## Requirements
+
+- `codex`
+- `google-chrome` or `chromium`
+- `xvfb-run`
+
+For the recommended OCR/X11 mode, install these as well:
+
+- `xdotool`
+- `imagemagick`
+- `tesseract-ocr`
+
+On Ubuntu, a typical setup is:
+
+```bash
+sudo apt-get install -y xvfb xdotool imagemagick tesseract-ocr
+```
+
 ## Usage
 
 ```bash
@@ -23,6 +41,10 @@ The script will:
 4. open the login page in that remote browser
 5. show visible text and interactive controls in the terminal
 6. let you fill fields and click buttons with terminal commands
+
+When OCR/X11 mode is active, the helper also forces the auth URL back into the
+browser address bar during startup so Chrome update or restore tabs do not block
+the login page.
 
 ## Terminal commands
 
@@ -41,6 +63,8 @@ The script will:
 
 - This is still browser automation, not a pure text-only login protocol.
 - With `xvfb-run`, the browser runs in a virtual display instead of headless mode.
+- OCR/X11 mode is only enabled when `xvfb-run`, `xdotool`, `imagemagick`, and
+  `tesseract-ocr` are all available.
 - Password and OTP style flows should work better than passkeys.
 - CAPTCHA or future login UI changes may still break automation.
 - You can override the browser binary with `BROWSER_BIN=/path/to/browser`.

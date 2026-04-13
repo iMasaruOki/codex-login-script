@@ -794,6 +794,37 @@ async function clickElementHuman(state, x, y) {
   await xdotool(state, ["click", "--delay", "80", "1"]);
 }
 
+async function openUrlInBrowserChrome(state, url) {
+  await xdotool(state, ["key", "--clearmodifiers", "ctrl+l"]);
+  await sleep(150);
+  await xdotool(state, ["type", "--delay", "20", "--clearmodifiers", url]);
+  await sleep(120);
+  await xdotool(state, ["key", "--clearmodifiers", "Return"]);
+}
+
+function isChromeInterruptionSnapshot(snapshot) {
+  const text = `${snapshot.title || ""}\n${snapshot.text || ""}`;
+  return /can't update chrome|finish update|chrome couldn't update|restore pages|restore/i.test(text);
+}
+
+async function stabilizeOcrBrowser(state, authUrl) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await openUrlInBrowserChrome(state, authUrl);
+    await sleep(1800);
+    const snapshot = await captureOcrSnapshot(state);
+    state.lastSnapshot = snapshot;
+    const text = `${snapshot.title || ""}\n${snapshot.text || ""}`;
+    if (/welcome back|enter your password|continue with google|email address/i.test(text)) {
+      state.lastSeenUrl = authUrl;
+      return;
+    }
+    if (!isChromeInterruptionSnapshot(snapshot) && snapshot.elements.length > 0) {
+      state.lastSeenUrl = authUrl;
+      return;
+    }
+  }
+}
+
 async function setElementValue(state, elementId, value) {
   const client = state.client;
   if (!client && state.xDisplayEnv) {
@@ -1397,6 +1428,8 @@ async function main() {
   const browserStartUrl = browserMode === "xvfb" ? authUrl : "about:blank";
   const browserArgs = [
     "--hide-crash-restore-bubble",
+    "--disable-background-networking",
+    "--disable-component-update",
     "--no-first-run",
     "--no-default-browser-check",
     "--window-size=1280,900",
@@ -1496,6 +1529,7 @@ async function main() {
         targetId: null,
         webSocketDebuggerUrl: null,
       };
+      await stabilizeOcrBrowser(state, authUrl);
     } else {
       const browserWs = await waitForDevTools(browserChild, browserBuffer);
       const browserDebugPort = new URL(browserWs).port;

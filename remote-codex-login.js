@@ -44,6 +44,59 @@ function execCapture(cmd, args) {
   });
 }
 
+function execCaptureEnv(cmd, args, env) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], env });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("close", (code) => {
+      resolve({ code, stdout, stderr });
+    });
+  });
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function parseTesseractTsv(tsvText) {
+  const lines = tsvText.split("\n").filter(Boolean);
+  if (lines.length <= 1) {
+    return [];
+  }
+
+  const rows = [];
+  for (const line of lines.slice(1)) {
+    const parts = line.split("\t");
+    if (parts.length < 12) {
+      continue;
+    }
+    const [level, pageNum, blockNum, parNum, lineNum, wordNum, left, top, width, height, conf, ...rest] = parts;
+    const text = rest.join("\t").trim();
+    rows.push({
+      level: Number(level),
+      pageNum: Number(pageNum),
+      blockNum: Number(blockNum),
+      parNum: Number(parNum),
+      lineNum: Number(lineNum),
+      wordNum: Number(wordNum),
+      left: Number(left),
+      top: Number(top),
+      width: Number(width),
+      height: Number(height),
+      conf: Number(conf),
+      text,
+    });
+  }
+  return rows;
+}
+
 async function promptYesNo(prompt, defaultNo = true) {
   while (true) {
     const suffix = defaultNo ? " [y/N]: " : " [Y/n]: ";
@@ -164,6 +217,7 @@ class CdpClient {
     this.nextId = 1;
     this.pending = new Map();
     this.ws = null;
+    this.eventHandlers = new Map();
   }
 
   async connect() {
@@ -181,6 +235,13 @@ class CdpClient {
           } else {
             handlers.resolve(message.result || {});
           }
+        } else if (message.method) {
+          const handlers = this.eventHandlers.get(message.method) || [];
+          for (const handler of handlers) {
+            try {
+              handler(message.params || {});
+            } catch {}
+          }
         }
       });
       this.ws.on("close", () => {
@@ -190,6 +251,12 @@ class CdpClient {
         this.pending.clear();
       });
     });
+  }
+
+  on(method, handler) {
+    const handlers = this.eventHandlers.get(method) || [];
+    handlers.push(handler);
+    this.eventHandlers.set(method, handlers);
   }
 
   call(method, params = {}) {
@@ -245,7 +312,97 @@ async function waitForDevTools(proc, buffer) {
     }
     await sleep(200);
   }
-  throw new Error("Timed out waiting for Chromium DevTools");
+  throw new Error(`Timed out waiting for Chromium DevTools\n${(buffer.stdout || "")}${(buffer.stderr || "")}`.trim());
+}
+
+async function waitForXvfbEnv(proc, buffer) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const combined = `${buffer.stdout || ""}${buffer.stderr || ""}`;
+    const match = combined.match(/XVFB_ENV:([^|\s]+)\|([^\n\r]*)/);
+    if (match) {
+      return {
+        DISPLAY: match[1],
+        XAUTHORITY: match[2] || "",
+      };
+    }
+    if (proc.exitCode !== null) {
+      throw new Error("Browser launcher exited before exposing xvfb environment");
+    }
+    await sleep(100);
+  }
+  throw new Error("Timed out waiting for xvfb environment");
+}
+
+async function captureOcrSnapshot(state) {
+  const pngPath = path.join(os.tmpdir(), `codex-login-${Date.now()}.png`);
+  try {
+    const env = { ...process.env, ...state.xDisplayEnv };
+    const importResult = await execCaptureEnv(
+      "import",
+      ["-display", state.xDisplayEnv.DISPLAY, "-window", "root", pngPath],
+      env,
+    );
+    if (importResult.code !== 0) {
+      throw new Error(importResult.stderr || importResult.stdout || "import failed");
+    }
+
+    const tsvResult = await execCaptureEnv(
+      "tesseract",
+      [pngPath, "stdout", "--psm", "11", "tsv"],
+      env,
+    );
+    if (tsvResult.code !== 0) {
+      throw new Error(tsvResult.stderr || tsvResult.stdout || "tesseract failed");
+    }
+
+    const rows = parseTesseractTsv(tsvResult.stdout);
+    const words = rows.filter((row) => row.level === 5 && row.text && row.conf >= 0);
+    const grouped = new Map();
+    for (const word of words) {
+      const key = `${word.pageNum}:${word.blockNum}:${word.parNum}:${word.lineNum}`;
+      const bucket = grouped.get(key) || [];
+      bucket.push(word);
+      grouped.set(key, bucket);
+    }
+
+    const elements = Array.from(grouped.values())
+      .map((bucket, index) => {
+        bucket.sort((a, b) => a.left - b.left);
+        const label = bucket.map((word) => word.text).join(" ").trim();
+        const left = Math.min(...bucket.map((word) => word.left));
+        const top = Math.min(...bucket.map((word) => word.top));
+        const right = Math.max(...bucket.map((word) => word.left + word.width));
+        const bottom = Math.max(...bucket.map((word) => word.top + word.height));
+        return {
+          id: String(index),
+          tag: "text",
+          type: "",
+          label,
+          placeholder: "",
+          name: "",
+          value: "",
+          options: [],
+          left,
+          top,
+          right,
+          bottom,
+          x: left + ((right - left) / 2),
+          y: top + ((bottom - top) / 2),
+        };
+      })
+      .filter((entry) => entry.label);
+
+    return {
+      title: "OCR snapshot",
+      url: state.lastSeenUrl || "(screen)",
+      text: elements.map((entry) => entry.label).join("\n"),
+      elements,
+    };
+  } finally {
+    try {
+      fs.rmSync(pngPath, { force: true });
+    } catch {}
+  }
 }
 
 async function terminateProcess(child) {
@@ -276,6 +433,27 @@ async function closeClient(client) {
   try {
     client.ws.terminate();
   } catch {}
+}
+
+function pushDebugEvent(state, event) {
+  state.debugEvents.push({
+    ...event,
+    at: new Date().toISOString(),
+  });
+  if (state.debugEvents.length > 40) {
+    state.debugEvents.splice(0, state.debugEvents.length - 40);
+  }
+}
+
+function isInterestingAuthUrl(url = "") {
+  return url.includes("auth.openai.com/api/accounts/authorize/continue");
+}
+
+function trimText(value, maxLength = 500) {
+  if (!value) {
+    return "";
+  }
+  return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value;
 }
 
 function killProcessNow(child) {
@@ -384,7 +562,12 @@ async function navigate(client, url) {
   await sleep(1200);
 }
 
-async function hardenBrowserSession(client) {
+async function hardenBrowserSession(client, options = {}) {
+  const { browserMode = "headless" } = options;
+  if (browserMode !== "headless") {
+    return;
+  }
+
   await client.call("Page.addScriptToEvaluateOnNewDocument", {
     source: `
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -399,6 +582,116 @@ async function hardenBrowserSession(client) {
   if (userAgent) {
     await client.call("Network.setUserAgentOverride", { userAgent });
   }
+}
+
+async function attachDebugListeners(state) {
+  const client = state.client;
+  client.on("Runtime.consoleAPICalled", (params) => {
+    const text = (params.args || [])
+      .map((arg) => arg.value ?? arg.description ?? arg.unserializableValue ?? "")
+      .filter(Boolean)
+      .join(" ");
+    pushDebugEvent(state, {
+      type: "console",
+      level: params.type || "log",
+      text,
+    });
+  });
+
+  client.on("Runtime.exceptionThrown", (params) => {
+    const details = params.exceptionDetails || {};
+    pushDebugEvent(state, {
+      type: "exception",
+      level: "error",
+      text: details.text || details.exception?.description || "Runtime exception",
+    });
+  });
+
+  client.on("Log.entryAdded", (params) => {
+    const entry = params.entry || {};
+    pushDebugEvent(state, {
+      type: "log",
+      level: entry.level || "info",
+      text: `${entry.source || "log"}: ${entry.text || ""}`.trim(),
+    });
+  });
+
+  client.on("Network.requestWillBeSent", (params) => {
+    const request = params.request || {};
+    if (isInterestingAuthUrl(request.url)) {
+      state.interestingRequests.set(params.requestId, {
+        url: request.url,
+        method: request.method || "GET",
+        requestHeaders: request.headers || {},
+        requestPostData: request.postData || "",
+      });
+    }
+    pushDebugEvent(state, {
+      type: "request",
+      level: "info",
+      text: `${request.method || "GET"} ${request.url || ""}`.trim(),
+    });
+  });
+
+  client.on("Network.responseReceived", (params) => {
+    const response = params.response || {};
+    if (state.interestingRequests.has(params.requestId)) {
+      const detail = state.interestingRequests.get(params.requestId);
+      detail.status = response.status;
+      detail.responseHeaders = response.headers || {};
+      detail.mimeType = response.mimeType || "";
+      detail.responseUrl = response.url || detail.url;
+    }
+    pushDebugEvent(state, {
+      type: "response",
+      level: response.status >= 400 ? "error" : "info",
+      text: `${response.status || ""} ${response.url || ""}`.trim(),
+    });
+  });
+
+  client.on("Network.requestWillBeSentExtraInfo", (params) => {
+    if (!state.interestingRequests.has(params.requestId)) {
+      return;
+    }
+    const detail = state.interestingRequests.get(params.requestId);
+    detail.requestExtraHeaders = params.headers || {};
+  });
+
+  client.on("Network.responseReceivedExtraInfo", (params) => {
+    if (!state.interestingRequests.has(params.requestId)) {
+      return;
+    }
+    const detail = state.interestingRequests.get(params.requestId);
+    detail.responseExtraHeaders = params.headers || {};
+    detail.responseStatusCode = params.statusCode;
+  });
+
+  client.on("Network.loadingFinished", async (params) => {
+    if (!state.interestingRequests.has(params.requestId)) {
+      return;
+    }
+    const detail = state.interestingRequests.get(params.requestId);
+    try {
+      const bodyResult = await client.call("Network.getResponseBody", {
+        requestId: params.requestId,
+      });
+      detail.responseBody = bodyResult.base64Encoded
+        ? Buffer.from(bodyResult.body, "base64").toString("utf8")
+        : bodyResult.body;
+    } catch (error) {
+      detail.responseBody = `Failed to read response body: ${error.message}`;
+    }
+  });
+
+  client.on("Network.loadingFailed", (params) => {
+    pushDebugEvent(state, {
+      type: "network",
+      level: "error",
+      text: `${params.errorText || "loading failed"} ${params.canceled ? "(canceled)" : ""}`.trim(),
+    });
+  });
+
+  await client.call("Log.enable");
 }
 
 async function clickElement(client, elementId) {
@@ -417,31 +710,118 @@ async function clickElement(client, elementId) {
 }
 
 async function clickElementAt(client, x, y) {
-  await client.call("Input.dispatchMouseEvent", {
-    type: "mouseMoved",
-    x,
-    y,
-    button: "none",
-  });
+  const startX = Math.max(1, x - 24);
+  const startY = Math.max(1, y - 12);
+  const steps = 4;
+
+  for (let step = 0; step <= steps; step += 1) {
+    const progress = step / steps;
+    await client.call("Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x: startX + ((x - startX) * progress),
+      y: startY + ((y - startY) * progress),
+      button: "none",
+      pointerType: "mouse",
+    });
+    await sleep(35);
+  }
+
+  await sleep(80);
   await client.call("Input.dispatchMouseEvent", {
     type: "mousePressed",
     x,
     y,
     button: "left",
     clickCount: 1,
+    pointerType: "mouse",
   });
+  await sleep(55);
   await client.call("Input.dispatchMouseEvent", {
     type: "mouseReleased",
     x,
     y,
     button: "left",
     clickCount: 1,
+    pointerType: "mouse",
   });
 }
 
-async function setElementValue(client, elementId, value) {
+async function getWindowMetrics(client) {
+  const result = await client.call("Runtime.evaluate", {
+    expression: `(() => ({
+      screenX: window.screenX || 0,
+      screenY: window.screenY || 0,
+      outerWidth: window.outerWidth || 0,
+      outerHeight: window.outerHeight || 0,
+      innerWidth: window.innerWidth || 0,
+      innerHeight: window.innerHeight || 0
+    }))()`,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  return result.result.value;
+}
+
+async function toAbsolutePoint(state, x, y) {
+  if (!state.client) {
+    return {
+      x: Math.round(x),
+      y: Math.round(y),
+    };
+  }
+  const metrics = await getWindowMetrics(state.client);
+  const horizontalBorder = Math.max(0, (metrics.outerWidth - metrics.innerWidth) / 2);
+  const verticalChrome = Math.max(0, metrics.outerHeight - metrics.innerHeight - horizontalBorder);
+  return {
+    x: Math.round(metrics.screenX + horizontalBorder + x),
+    y: Math.round(metrics.screenY + verticalChrome + y),
+  };
+}
+
+async function xdotool(state, args) {
+  const env = { ...process.env, ...state.xDisplayEnv };
+  const result = await execCaptureEnv("xdotool", args, env);
+  if (result.code !== 0) {
+    throw new Error(`xdotool failed: ${result.stderr || result.stdout}`.trim());
+  }
+  return result;
+}
+
+async function clickElementHuman(state, x, y) {
+  const point = await toAbsolutePoint(state, x, y);
+  await xdotool(state, ["mousemove", "--sync", String(point.x), String(point.y)]);
+  await sleep(120);
+  await xdotool(state, ["click", "--delay", "80", "1"]);
+}
+
+async function setElementValue(state, elementId, value) {
+  const client = state.client;
+  if (!client && state.xDisplayEnv) {
+    const element = state.lastSnapshot ? findElement(state.lastSnapshot, Number(elementId)) : null;
+    if (!element) {
+      return "missing";
+    }
+    let targetX = element.x;
+    let targetY = element.y;
+    if (/\b(email|password|phone|code|address)\b/i.test(element.label || "")) {
+      const left = element.left || element.x;
+      const right = element.right || element.x;
+      const bottom = element.bottom || element.y;
+      targetX = Math.min(left + Math.max(220, (right - left) + 180), 1180);
+      targetY = bottom + 22;
+    }
+    await clickElementHuman(state, targetX, targetY);
+    await sleep(120);
+    await xdotool(state, ["key", "--clearmodifiers", "ctrl+a"]);
+    await sleep(80);
+    await xdotool(state, ["key", "--clearmodifiers", "BackSpace"]);
+    await sleep(80);
+    await xdotool(state, ["type", "--delay", "45", "--clearmodifiers", value]);
+    return "ok";
+  }
+
   const payload = JSON.stringify(value);
-  const expression = `(() => {
+  const prepareExpression = `(() => {
     const el = document.querySelector('[data-codex-login-id="${elementId}"]');
     if (!el) return 'missing';
     const tag = el.tagName.toLowerCase();
@@ -451,20 +831,80 @@ async function setElementValue(client, elementId, value) {
       );
       if (!option) return 'no-option';
       el.value = option.value;
-    } else {
-      el.focus();
-      el.value = ${payload};
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return 'ok';
     }
+
+    el.focus();
+
+    if (tag === 'input' || tag === 'textarea') {
+      const prototype = Object.getPrototypeOf(el);
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
+      if (descriptor && descriptor.set) {
+        descriptor.set.call(el, '');
+      } else {
+        el.value = '';
+      }
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      return 'ready-for-typing';
+    }
+
+    el.textContent = ${payload};
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
     return 'ok';
   })()`;
-  const result = await client.call("Runtime.evaluate", {
-    expression,
+  const prepared = await client.call("Runtime.evaluate", {
+    expression: prepareExpression,
     returnByValue: true,
     awaitPromise: true,
   });
-  return result.result.value;
+
+  if (prepared.result.value !== 'ready-for-typing') {
+    return prepared.result.value;
+  }
+
+  if (state.xDisplayEnv) {
+    const element = await client.call("Runtime.evaluate", {
+      expression: `(() => {
+        const el = document.querySelector('[data-codex-login-id="${elementId}"]');
+        if (!el) return null;
+        const rect = el.getBoundingClientRect();
+        return { x: rect.left + (rect.width / 2), y: rect.top + (rect.height / 2) };
+      })()`,
+      returnByValue: true,
+      awaitPromise: true,
+    });
+    const point = element.result.value;
+    if (!point) {
+      return "missing";
+    }
+    await clickElementHuman(state, point.x, point.y);
+    await sleep(120);
+    await xdotool(state, ["key", "--clearmodifiers", "ctrl+a"]);
+    await sleep(80);
+    await xdotool(state, ["key", "--clearmodifiers", "BackSpace"]);
+    await sleep(80);
+    await xdotool(state, ["type", "--delay", "45", "--clearmodifiers", value]);
+  } else {
+    await client.call("Input.insertText", { text: value });
+  }
+
+  const finalize = await client.call("Runtime.evaluate", {
+    expression: `(() => {
+      const el = document.querySelector('[data-codex-login-id="${elementId}"]');
+      if (!el) return 'missing';
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      el.dispatchEvent(new Event('blur', { bubbles: true }));
+      return el.value || '';
+    })()`,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+
+  return finalize.result.value === value ? 'ok' : 'verify-failed';
 }
 
 async function submitActiveElement(client) {
@@ -518,10 +958,103 @@ async function maybeSwitchTarget(state, previousUrl = "") {
   await state.client.call("Page.enable");
   await state.client.call("Runtime.enable");
   await state.client.call("Network.enable");
+  await attachDebugListeners(state);
   state.targetId = best.id;
   state.webSocketDebuggerUrl = best.webSocketDebuggerUrl;
   process.stdout.write(`Switched to browser target: ${best.url || "(untitled)"}\n`);
   return true;
+}
+
+function renderDebugEvents(state, onlyErrors = false) {
+  const events = onlyErrors
+    ? state.debugEvents.filter((event) => event.level === "error").slice(-10)
+    : state.debugEvents.slice(-12);
+
+  if (events.length === 0) {
+    process.stdout.write("No debug events captured.\n");
+    return;
+  }
+
+  process.stdout.write("Recent debug events:\n");
+  for (const event of events) {
+    process.stdout.write(`  [${event.level}] ${event.type}: ${event.text}\n`);
+  }
+}
+
+function renderInterestingRequests(state) {
+  const entries = Array.from(state.interestingRequests.values()).slice(-3);
+  if (entries.length === 0) {
+    process.stdout.write("No detailed auth requests captured.\n");
+    return;
+  }
+
+  process.stdout.write("Detailed auth request traces:\n");
+  for (const entry of entries) {
+    process.stdout.write(`  ${entry.method} ${entry.url}\n`);
+    if (entry.status) {
+      process.stdout.write(`    status: ${entry.status}\n`);
+    }
+    if (entry.requestHeaders) {
+      const headerKeys = ["content-type", "origin", "referer", "x-requested-with", "sec-fetch-site", "sec-fetch-mode"];
+      for (const key of headerKeys) {
+        const foundKey = Object.keys(entry.requestHeaders).find((name) => name.toLowerCase() === key);
+        if (foundKey) {
+          process.stdout.write(`    req ${foundKey}: ${trimText(String(entry.requestHeaders[foundKey]), 180)}\n`);
+        }
+      }
+    }
+    if (entry.requestExtraHeaders) {
+      const headerKeys = ["cookie", "origin", "referer", "user-agent", "x-csrf-token", "authorization"];
+      for (const key of headerKeys) {
+        const foundKey = Object.keys(entry.requestExtraHeaders).find((name) => name.toLowerCase() === key);
+        if (foundKey) {
+          process.stdout.write(`    req+ ${foundKey}: ${trimText(String(entry.requestExtraHeaders[foundKey]), 220)}\n`);
+        }
+      }
+    }
+    if (entry.requestPostData) {
+      process.stdout.write(`    req body: ${trimText(entry.requestPostData, 220)}\n`);
+    }
+    if (entry.responseHeaders) {
+      const headerKeys = ["content-type", "location", "server"];
+      for (const key of headerKeys) {
+        const foundKey = Object.keys(entry.responseHeaders).find((name) => name.toLowerCase() === key);
+        if (foundKey) {
+          process.stdout.write(`    res ${foundKey}: ${trimText(String(entry.responseHeaders[foundKey]), 180)}\n`);
+        }
+      }
+    }
+    if (entry.responseExtraHeaders) {
+      const headerKeys = ["cf-mitigated", "set-cookie", "content-type", "location", "server"];
+      for (const key of headerKeys) {
+        const foundKey = Object.keys(entry.responseExtraHeaders).find((name) => name.toLowerCase() === key);
+        if (foundKey) {
+          process.stdout.write(`    res+ ${foundKey}: ${trimText(String(entry.responseExtraHeaders[foundKey]), 220)}\n`);
+        }
+      }
+    }
+    if (entry.responseBody) {
+      process.stdout.write(`    res body: ${trimText(entry.responseBody.replace(/\s+/g, " "), 260)}\n`);
+    }
+  }
+}
+
+async function renderCookies(state) {
+  const result = await state.client.call("Network.getCookies", {
+    urls: ["https://auth.openai.com/", "https://chatgpt.com/"],
+  });
+  const cookies = result.cookies || [];
+  if (cookies.length === 0) {
+    process.stdout.write("No cookies captured for auth.openai.com or chatgpt.com.\n");
+    return;
+  }
+
+  process.stdout.write("Current cookies:\n");
+  for (const cookie of cookies) {
+    process.stdout.write(
+      `  ${cookie.domain}  ${cookie.name}=${trimText(cookie.value, 80)}  secure=${cookie.secure ? "yes" : "no"} httpOnly=${cookie.httpOnly ? "yes" : "no"}\n`,
+    );
+  }
 }
 
 function findElement(snapshot, index) {
@@ -567,13 +1100,21 @@ function renderSnapshot(snapshot) {
   process.stdout.write("  open URL     navigate to URL\n");
   process.stdout.write("  wait         wait and refresh\n");
   process.stdout.write("  show         refresh now\n");
+  process.stdout.write("  key KEYS     send raw key sequence in OCR/X11 mode\n");
+  process.stdout.write("  diag         show recent debug events\n");
+  process.stdout.write("  diagerr      show recent error events\n");
+  process.stdout.write("  diagreq      show detailed auth request traces\n");
+  process.stdout.write("  cookies      show current auth cookies\n");
   process.stdout.write("  quit         stop the helper\n");
   process.stdout.write("\n");
 }
 
 async function interactiveLoop(state, codexChild) {
   while (true) {
-    const snapshot = await snapshotPage(state.client);
+    const snapshot = state.mode === "ocr"
+      ? await captureOcrSnapshot(state)
+      : await snapshotPage(state.client);
+    state.lastSnapshot = snapshot;
     renderSnapshot(snapshot);
 
     if (codexChild.exitCode !== null) {
@@ -595,13 +1136,52 @@ async function interactiveLoop(state, codexChild) {
       continue;
     }
 
+    if (command === "diag") {
+      renderDebugEvents(state, false);
+      continue;
+    }
+
+    if (command === "diagerr") {
+      renderDebugEvents(state, true);
+      continue;
+    }
+
+    if (command === "diagreq") {
+      renderInterestingRequests(state);
+      continue;
+    }
+
+    if (command === "cookies") {
+      await renderCookies(state);
+      continue;
+    }
+
     if (command === "wait") {
       await sleep(1500);
       continue;
     }
 
+    if (command === "key") {
+      if (!state.xDisplayEnv) {
+        process.stdout.write("`key` is only available in OCR/X11 mode.\n");
+        continue;
+      }
+      const keys = rest.join(" ").trim();
+      if (!keys) {
+        process.stdout.write("Usage: key KEYS\n");
+        continue;
+      }
+      await xdotool(state, ["key", "--clearmodifiers", keys]);
+      await sleep(700);
+      continue;
+    }
+
     if (command === "back") {
-      await state.client.call("Page.goBack");
+      if (state.client) {
+        await state.client.call("Page.goBack");
+      } else {
+        await xdotool(state, ["key", "--clearmodifiers", "Alt_L+Left"]);
+      }
       await sleep(1200);
       continue;
     }
@@ -612,14 +1192,27 @@ async function interactiveLoop(state, codexChild) {
         process.stdout.write("Usage: open URL\n");
         continue;
       }
-      await navigate(state.client, url);
+      if (state.client) {
+        await navigate(state.client, url);
+      } else {
+        process.stdout.write("`open` is unavailable in OCR mode.\n");
+      }
       continue;
     }
 
     if (command === "enter") {
-      await submitActiveElement(state.client);
+      state.debugEvents.length = 0;
+      state.interestingRequests.clear();
+      if (state.client) {
+        await submitActiveElement(state.client);
+      } else {
+        await xdotool(state, ["key", "--clearmodifiers", "Return"]);
+      }
       await sleep(1200);
-      await maybeSwitchTarget(state, snapshot.url);
+      if (state.client) {
+        await maybeSwitchTarget(state, snapshot.url);
+        renderDebugEvents(state, true);
+      }
       continue;
     }
 
@@ -629,13 +1222,22 @@ async function interactiveLoop(state, codexChild) {
         process.stdout.write("Unknown control index.\n");
         continue;
       }
+      state.debugEvents.length = 0;
+      state.interestingRequests.clear();
       if (Number.isFinite(element.x) && Number.isFinite(element.y)) {
-        await clickElementAt(state.client, element.x, element.y);
+        if (state.xDisplayEnv) {
+          await clickElementHuman(state, element.x, element.y);
+        } else {
+          await clickElementAt(state.client, element.x, element.y);
+        }
       } else {
         await clickElement(state.client, element.id);
       }
       await sleep(1200);
-      await maybeSwitchTarget(state, snapshot.url);
+      if (state.client) {
+        await maybeSwitchTarget(state, snapshot.url);
+        renderDebugEvents(state, true);
+      }
       continue;
     }
 
@@ -656,7 +1258,7 @@ async function interactiveLoop(state, codexChild) {
         value = await promptLine(`Value for control ${rest[0]}: `);
       }
 
-      const outcome = await setElementValue(state.client, element.id, value);
+      const outcome = await setElementValue(state, element.id, value);
       if (outcome === "no-option") {
         process.stdout.write("No matching option.\n");
       }
@@ -672,11 +1274,37 @@ function createTempDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
+function ensureDir(dirPath) {
+  fs.mkdirSync(dirPath, { recursive: true });
+  return dirPath;
+}
+
+function prepareBrowserProfileDir(baseDir) {
+  ensureDir(baseDir);
+  const sessionDir = createTempDir("codex-login-browser-");
+  for (const entry of fs.readdirSync(baseDir)) {
+    if (
+      entry.startsWith("Singleton") ||
+      entry === "DevToolsActivePort" ||
+      entry === "lockfile" ||
+      entry === ".org.chromium.Chromium" ||
+      entry === ".com.google.Chrome"
+    ) {
+      continue;
+    }
+    fs.cpSync(path.join(baseDir, entry), path.join(sessionDir, entry), {
+      recursive: true,
+      force: true,
+    });
+  }
+  return sessionDir;
+}
+
 function chooseBrowserBinary() {
   if (process.env.BROWSER_BIN) {
     return process.env.BROWSER_BIN;
   }
-  for (const candidate of ["chromium", "google-chrome"]) {
+  for (const candidate of ["google-chrome", "chromium"]) {
     if (commandExists(candidate)) {
       return candidate;
     }
@@ -752,26 +1380,68 @@ async function main() {
   process.stdout.write("Starting browser on the remote host.\n");
   process.stdout.write(`Codex callback port: ${loginPort}\n\n`);
 
-  const browserUserDataDir = createTempDir("codex-login-browser-");
-  const browserBuffer = { stdout: "", stderr: "" };
   const browserBinary = chooseBrowserBinary();
-  const browserArgs = [
-    "--disable-gpu",
-    "--disable-blink-features=AutomationControlled",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--remote-debugging-port=0",
-    `--user-data-dir=${browserUserDataDir}`,
-    "about:blank",
-  ];
+  const browserProfileRoot = ensureDir(path.join(process.cwd(), ".browser-profile"));
+  const browserProfileBaseDir = process.env.BROWSER_PROFILE_DIR
+    ? ensureDir(process.env.BROWSER_PROFILE_DIR)
+    : ensureDir(path.join(browserProfileRoot, browserBinary.replace(/[^a-zA-Z0-9._-]/g, "_")));
+  const browserUserDataDir = prepareBrowserProfileDir(browserProfileBaseDir);
+  const browserBuffer = { stdout: "", stderr: "" };
   let browserMode = "headless";
   let browserCommand = browserBinary;
-  let browserCommandArgs = ["--headless=new", ...browserArgs];
 
   if (commandExists("xvfb-run")) {
     browserMode = "xvfb";
+  }
+  const useOcrMode = browserMode === "xvfb" && commandExists("xdotool") && commandExists("import") && commandExists("tesseract");
+  const browserStartUrl = browserMode === "xvfb" ? authUrl : "about:blank";
+  const browserArgs = [
+    "--hide-crash-restore-bubble",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--window-size=1280,900",
+    "--window-position=0,0",
+    `--user-data-dir=${browserUserDataDir}`,
+  ];
+
+  let browserCommandArgs;
+  if (browserMode === "headless") {
+    browserCommandArgs = [
+      "--headless=new",
+      "--disable-gpu",
+      "--disable-blink-features=AutomationControlled",
+      "--remote-debugging-port=0",
+      ...browserArgs,
+      browserStartUrl,
+    ];
+  } else if (useOcrMode) {
     browserCommand = "xvfb-run";
-    browserCommandArgs = ["-a", browserBinary, ...browserArgs];
+    const browserCommandLine = [
+      browserBinary,
+      ...browserArgs,
+      browserStartUrl,
+    ].map(shellQuote).join(" ");
+    browserCommandArgs = [
+      "-a",
+      "bash",
+      "-lc",
+      `printf 'XVFB_ENV:%s|%s\n' "$DISPLAY" "\${XAUTHORITY:-}"; exec ${browserCommandLine}`,
+    ];
+  } else {
+    browserCommand = "xvfb-run";
+    const browserCommandLine = [
+      browserBinary,
+      "--disable-gpu",
+      "--remote-debugging-port=0",
+      ...browserArgs,
+      browserStartUrl,
+    ].map(shellQuote).join(" ");
+    browserCommandArgs = [
+      "-a",
+      "bash",
+      "-lc",
+      `printf 'XVFB_ENV:%s|%s\n' "$DISPLAY" "\${XAUTHORITY:-}"; exec ${browserCommandLine}`,
+    ];
   }
 
   const browserChild = spawn(browserCommand, browserCommandArgs, {
@@ -809,26 +1479,68 @@ async function main() {
   });
 
   try {
-    const browserWs = await waitForDevTools(browserChild, browserBuffer);
-    const browserDebugPort = new URL(browserWs).port;
-    const pageInfo = await httpPut(`http://127.0.0.1:${browserDebugPort}/json/new?about:blank`);
-    const page = JSON.parse(pageInfo);
+    const xDisplayEnv = browserMode === "xvfb" ? await waitForXvfbEnv(browserChild, browserBuffer) : null;
+    if (browserMode === "xvfb") {
+      await sleep(5000);
+    }
+    if (useOcrMode) {
+      state = {
+        client: null,
+        debugPort: null,
+        debugEvents: [],
+        interestingRequests: new Map(),
+        lastSeenUrl: authUrl,
+        lastSnapshot: null,
+        mode: "ocr",
+        xDisplayEnv,
+        targetId: null,
+        webSocketDebuggerUrl: null,
+      };
+    } else {
+      const browserWs = await waitForDevTools(browserChild, browserBuffer);
+      const browserDebugPort = new URL(browserWs).port;
+      let page;
+      if (browserMode === "xvfb") {
+        const targets = await listPageTargets(browserDebugPort);
+        page = targets
+          .map((target) => ({ target, score: targetScore(target) }))
+          .sort((a, b) => b.score - a.score)[0]?.target;
+        if (!page) {
+          throw new Error("No browser page target found");
+        }
+      } else {
+        const pageInfo = await httpPut(`http://127.0.0.1:${browserDebugPort}/json/new?about:blank`);
+        page = JSON.parse(pageInfo);
+      }
 
-    const client = new CdpClient(page.webSocketDebuggerUrl);
-    await client.connect();
-    await client.call("Page.enable");
-    await client.call("Runtime.enable");
-    await client.call("Network.enable");
-    await hardenBrowserSession(client);
-    await navigate(client, authUrl);
-    state = {
-      client,
-      debugPort: browserDebugPort,
-      targetId: page.id,
-      webSocketDebuggerUrl: page.webSocketDebuggerUrl,
-    };
+      const client = new CdpClient(page.webSocketDebuggerUrl);
+      await client.connect();
+      await client.call("Page.enable");
+      await client.call("Runtime.enable");
+      await client.call("Network.enable");
+      await hardenBrowserSession(client, { browserMode });
+      if (browserMode !== "xvfb") {
+        await navigate(client, authUrl);
+      }
+      state = {
+        client,
+        debugPort: browserDebugPort,
+        debugEvents: [],
+        interestingRequests: new Map(),
+        lastSeenUrl: authUrl,
+        lastSnapshot: null,
+        mode: "dom",
+        xDisplayEnv,
+        targetId: page.id,
+        webSocketDebuggerUrl: page.webSocketDebuggerUrl,
+      };
+      await attachDebugListeners(state);
+    }
 
     process.stdout.write(`The browser page is open on the remote host (${browserMode} mode).\n`);
+    if (useOcrMode) {
+      process.stdout.write("OCR mode is active. Screen text is detected from screenshots, and input is sent through X11.\n");
+    }
     process.stdout.write("Use the terminal commands below to fill fields and click buttons.\n");
     process.stdout.write("Passkeys and CAPTCHA may still require a different auth path.\n");
 

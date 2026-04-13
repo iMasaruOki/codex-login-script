@@ -1,19 +1,13 @@
 # Codex Remote Login Script
 
-`remote-codex-login.sh` wraps regular `codex login` for remote console use.
+`remote-codex-login.sh` wraps `codex login` and drives the ChatGPT login page
+through Chromium running on the remote host.
 
-The normal browser login flow starts a callback server on the remote host such
-as `http://localhost:1455/auth/callback`. If you open the login URL on your
-local machine, the browser tries to redirect to your own localhost and the
-final step does not reach the remote host automatically.
+The browser backend stays on the remote machine, so the OAuth callback to
+`http://localhost:PORT/auth/callback` also lands on the remote machine.
 
-This script solves that by:
-
-1. starting `codex login`
-2. extracting and printing the ChatGPT login URL
-3. asking you to finish login in your local browser
-4. asking you to paste the final `http://localhost:PORT/auth/callback?...` URL
-5. replaying that callback against the remote host's localhost port
+If `xvfb-run` is available, the script prefers a normal Chromium session inside
+Xvfb. Otherwise it falls back to headless Chromium.
 
 ## Usage
 
@@ -21,21 +15,32 @@ This script solves that by:
 ./remote-codex-login.sh
 ```
 
-After the script prints the login URL:
+The script will:
 
-1. open it in a browser on your local machine
-2. sign in with your account
-3. complete password or passkey flow
-4. choose a workspace if ChatGPT asks
-5. copy the final failed `localhost` URL from the browser address bar
-6. paste that URL back into the script
+1. start `codex login`
+2. extract the ChatGPT OAuth URL that Codex prints
+3. launch Chromium on the remote host
+4. open the login page in that remote browser
+5. show visible text and interactive controls in the terminal
+6. let you fill fields and click buttons with terminal commands
 
-## Options
+## Terminal commands
 
-```bash
-./remote-codex-login.sh --yes
-./remote-codex-login.sh --force
-```
+- `click N`: click control `N`
+- `fill N`: type normal text into control `N`
+- `secret N`: type hidden text into control `N`
+- `choose N`: pick a value for select control `N`
+- `enter`: submit the focused field or form
+- `back`: go back
+- `open URL`: navigate to a specific URL
+- `wait`: wait briefly and refresh the page snapshot
+- `show`: refresh the page snapshot immediately
+- `quit`: stop the helper
 
-- `--yes`: skip the initial confirmation prompt
-- `--force`: start login even if Codex is already logged in
+## Notes
+
+- This is still browser automation, not a pure text-only login protocol.
+- With `xvfb-run`, the browser runs in a virtual display instead of headless mode.
+- Password and OTP style flows should work better than passkeys.
+- CAPTCHA or future login UI changes may still break automation.
+- You can override the browser binary with `BROWSER_BIN=/path/to/browser`.
